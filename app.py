@@ -27,7 +27,7 @@ MASTER_PATH = next(
     APP_DIR / "Master_Warranty_Template-v2.xlsx",
 )
 MASTER_SHEET = "Master_Product_Warranty"
-REQUIRED_COLUMNS = ("Billing Date", "Ship to name", "Billing", "Article")
+REQUIRED_COLUMNS = ("Billing Date", "Customer name", "Billing", "Article")
 SERIAL_COLUMNS = ("ManufSerialNumber", "Serial Number")
 MASTER_ARTICLE_COLUMNS = (
     "Article Code", "Article", "Article No.", "Article No", "Material", "Material No.",
@@ -197,11 +197,9 @@ def load_billing_file(content):
 
     billing = sales[[headers[name] for name in REQUIRED_COLUMNS]].copy()
     billing.columns = REQUIRED_COLUMNS
-    serials = sales[serial_cols[0]].map(clean_value)
-    if len(serial_cols) == 2:
-        serials = serials.mask(serials.eq(""), sales[serial_cols[1]].map(clean_value))
-    billing["Serial Number"] = serials
-    for name in ("Billing", "Ship to name", "Article"):
+    # Prefer ManufSerialNumber whenever that column exists; otherwise use Serial Number.
+    billing["Serial Number"] = sales[serial_cols[0]].map(clean_value)
+    for name in ("Billing", "Customer name", "Article"):
         billing[name] = billing[name].map(clean_value)
     if billing.empty:
         raise ValueError("ไฟล์ไม่มีรายการสินค้า")
@@ -211,9 +209,9 @@ def load_billing_file(content):
 
 
 def prepare_certificate(billing_no, billing, warranty_map, extensions, issue_date):
-    customers = billing["Ship to name"].loc[billing["Ship to name"].ne("")].unique()
+    customers = billing["Customer name"].loc[billing["Customer name"].ne("")].unique()
     if len(customers) != 1:
-        raise ValueError("บิลที่เลือกต้องระบุชื่อลูกค้า Ship to name เพียงชื่อเดียว")
+        raise ValueError("บิลที่เลือกต้องระบุชื่อลูกค้า Customer name เพียงชื่อเดียว")
     if billing["Article"].eq("").any():
         raise ValueError("บิลที่เลือกมีรายการที่เว้น Article ว่าง")
 
@@ -306,7 +304,7 @@ def main():
     uploaded = st.file_uploader(
         "ไฟล์ Excel (.xlsx)",
         type=["xlsx"],
-        help="ใช้คอลัมน์ Billing Date, Ship to name, Billing, Article และ ManufSerialNumber หรือ Serial Number",
+        help="ใช้คอลัมน์ Billing Date, Customer name, Billing, Article และ ManufSerialNumber หรือ Serial Number (ให้ความสำคัญกับ ManufSerialNumber ก่อนเสมอ)",
     )
     try:
         warranty_map = load_master_warranty()
