@@ -1,6 +1,9 @@
 """Run with: python -m streamlit run app.py"""
 
 import hashlib
+import os
+import shutil
+import threading
 import io
 import re
 import subprocess
@@ -9,6 +12,9 @@ import tempfile
 from datetime import date, datetime
 from numbers import Real
 from pathlib import Path
+from copy import copy
+
+from openpyxl import load_workbook
 
 import pandas as pd
 import streamlit as st
@@ -27,6 +33,7 @@ MASTER_PATH = next(
     APP_DIR / "Master_Warranty_Template-v2.xlsx",
 )
 MASTER_SHEET = "Master_Product_Warranty"
+MASTER_LOCK = threading.RLock()
 REQUIRED_COLUMNS = ("Billing Date", "Customer name", "Billing", "Article")
 SERIAL_COLUMNS = ("ManufSerialNumber", "Serial Number")
 MASTER_ARTICLE_COLUMNS = (
@@ -121,9 +128,9 @@ def format_document_date(value):
     )
 
 
-def load_master_warranty():
+def load_master_warranty(source=MASTER_PATH):
     raw = pd.read_excel(
-        MASTER_PATH,
+        source,
         sheet_name=MASTER_SHEET,
         header=None,
         dtype=object,
@@ -177,6 +184,153 @@ def load_master_warranty():
             raise ValueError(f"Article {article} มีเงื่อนไขรับประกันซ้ำที่ระบุข้อความต่างกัน")
         terms[article] = term
     return terms
+
+
+
+def master_header(ws):
+    """Discover the same header row used by load_master_warranty()."""
+    for cells in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 25)):
+        labels = [clean_value(cell.value) for cell in cells]
+        if find_prefixed_column(labels, MASTER_ARTICLE_COLUMNS) is not None:
+            header_row = cells[0].row
+            return header_row, labels
+    raise ValueError("ไม่พบแถวหัวตาราง Article Code ในชีต Master_Product_Warranty")
+
+
+def master_sheet(wb):
+    if MASTER_SHEET not in wb.sheetnames:
+        raise ValueError(f"ไม่พบชีต {MASTER_SHEET}")
+    return wb[MASTER_SHEET]
+
+
+def normalized_header(name):
+    return " ".join(clean_value(name).split()).casefold()
+
+
+def preview_master_merge(original_bytes, uploaded_bytes):
+    """Stage a non-destructive Excel merge in memory; nothing is saved yet."""
+    incoming_terms = load_master_warranty(io.BytesIO(uploaded_bytes))
+    if not incoming_terms:
+        raise ValueError("ไฟล์ที่อัปโหลดไม่มี Article พร้อมเงื่อนไขรับประกันที่ใช้ได้")
+    incoming_wb = load_workbook(io.BytesIO(uploaded_bytes))
+    incoming_ws = master_sheet(incoming_wb)
+    source_header_row, source_headers = master_header(incoming_ws)
+    source_article_header = find_prefixed_column(source_headers, MASTER_ARTICLE_COLUMNS)
+    source_article_col = source_headers.index(source_article_header) + 1
+    source_lookup = {normalized_header(name): i for i, name in enumerate(source_headers, 1) if name}
+
+    if original_bytes is None:
+        # The first upload becomes the durable master, retaining its workbook formatting.
+        return uploaded_bytes, [], sorted(incoming_terms), [], incoming_terms
+
+    original_terms = load_master_warranty(io.BytesIO(original_bytes))
+    wb = load_workbook(io.BytesIO(original_bytes))
+    ws = master_sheet(wb)
+    target_header_row, target_headers = master_header(ws)
+    target_article_header = find_prefixed_column(target_headers, MASTER_ARTICLE_COLUMNS)
+    article_col = target_headers.index(target_article_header) + 1
+    target_lookup = {normalized_header(name): i for i, name in enumerate(target_headers, 1) if name}
+
+    # Require the same warranty fields so that the merge cannot silently drop or
+    # misinterpret warranty conditions from differently structured workbooks.
+    warranty_prefixes = (
+        MASTER_PRODUCT_TERM_COLUMNS + MASTER_BASE_WARRANTY_COLUMNS +
+        MASTER_CATEGORY_COLUMNS + MASTER_PERFORMANCE_TERM_COLUMNS +
+        MASTER_PERFORMANCE_WARRANTY_COLUMNS
+    )
+    for header in source_headers:
+        if header and find_prefixed_column([header], warranty_prefixes):
+            if normalized_header(header) not in target_lookup:
+                raise ValueError(
+                    f"Master หลักไม่มีคอลัมน์ '{header}' กรุณาใช้ไฟล์ที่มีโครงสร้างคอลัมน์ตรงกับ Master หลัก"
+                )
+    matched = [(source_col, target_lookup[key]) for key, source_col in source_lookup.items() if key in target_lookup]
+    if not matched:
+        raise ValueError("ไม่พบคอลัมน์ที่ตรงกับ Master หลัก")
+
+    existing = {}
+    for row in range(target_header_row + 1, ws.max_row + 1):
+        article = clean_value(ws.cell(row, article_col).value)
+        if article:
+            if article in existing:
+                raise ValueError(f"Master หลักมี Article ซ้ำ: {article}")
+            existing[article] = row
+
+    seen = set()
+    for row in range(source_header_row + 1, incoming_ws.max_row + 1):
+        article = clean_value(incoming_ws.cell(row, source_article_col).value)
+        if article not in incoming_terms:
+            continue
+        if article in seen:
+            raise ValueError(f"ไฟล์ที่อัปโหลดมี Article ซ้ำ: {article}")
+        seen.add(article)
+        if article in existing:
+            target_row = existing[article]
+        else:
+            target_row = ws.max_row + 1
+            # Retain formatting without copying old article data or formulas.
+            if target_row > target_header_row + 1:
+                template_row = target_row - 1
+                for col in range(1, ws.max_column + 1):
+                    src_style = ws.cell(template_row, col)
+                    dst_style = ws.cell(target_row, col)
+                    if src_style.has_style:
+                        dst_style._style = copy(src_style._style)
+                    dst_style.number_format = src_style.number_format
+            existing[article] = target_row
+        for source_col, target_col in matched:
+            source_value = incoming_ws.cell(row, source_col).value
+            source_name = source_headers[source_col - 1]
+            is_warranty_field = bool(find_prefixed_column([source_name], warranty_prefixes))
+            # For warranties, empty means clear the old condition. For other fields,
+            # preserve prior metadata unless a new value was supplied.
+            if is_warranty_field or clean_value(source_value):
+                ws.cell(target_row, target_col).value = source_value
+        ws.cell(target_row, article_col).value = article
+
+    output = io.BytesIO()
+    wb.save(output)
+    merged_bytes = output.getvalue()
+    merged_terms = load_master_warranty(io.BytesIO(merged_bytes))
+    # Abort before saving if an incomplete column mapping would produce the wrong term.
+    for article, term in incoming_terms.items():
+        if merged_terms.get(article) != term:
+            raise ValueError(
+                f"เงื่อนไข Article {article} หลังรวมข้อมูลไม่ตรงกับไฟล์ที่อัปโหลด กรุณาตรวจสอบโครงสร้าง Master"
+            )
+    added = sorted(set(incoming_terms) - set(original_terms))
+    changed = sorted(article for article in incoming_terms if article in original_terms
+                     and incoming_terms[article] != original_terms[article])
+    unchanged = sorted(article for article in incoming_terms if article in original_terms
+                       and incoming_terms[article] == original_terms[article])
+    return merged_bytes, changed, added, unchanged, merged_terms
+
+
+def save_master_persistently(merged_bytes, expected_hash):
+    """Create a timestamped backup and atomically replace the local master file."""
+    MASTER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with MASTER_LOCK:
+        current = MASTER_PATH.read_bytes() if MASTER_PATH.exists() else None
+        actual_hash = hashlib.sha256(current).hexdigest() if current is not None else None
+        if actual_hash != expected_hash:
+            raise RuntimeError("Master ถูกแก้ไขหลังจาก Preview กรุณารีเฟรชและตรวจสอบอีกครั้ง")
+        # Backups are never overwritten, even with multiple saves in one second.
+        if current is not None:
+            backup_dir = MASTER_PATH.parent / "master_backups"
+            backup_dir.mkdir(exist_ok=True)
+            suffix = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            shutil.copy2(MASTER_PATH, backup_dir / f"{MASTER_PATH.stem}_{suffix}.xlsx")
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=MASTER_PATH.parent, suffix=".xlsx", delete=False) as fh:
+                temp_path = Path(fh.name)
+                fh.write(merged_bytes)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp_path, MASTER_PATH)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
 
 
 def load_billing_file(content):
@@ -306,13 +460,73 @@ def main():
         type=["xlsx"],
         help="ใช้คอลัมน์ Billing Date, Customer name, Billing, Article และ ManufSerialNumber หรือ Serial Number (ให้ความสำคัญกับ ManufSerialNumber ก่อนเสมอ)",
     )
-    try:
-        warranty_map = load_master_warranty()
-    except Exception as exc:
-        st.error(f"อ่าน Master Warranty ไม่สำเร็จ ({exc})")
-        return
+    st.subheader("2. อัปโหลดเงื่อนไขรับประกันสินค้า (Master Warranty)")
+    uploaded_master = st.file_uploader(
+        "อัปโหลดไฟล์เพื่อเพิ่มหรืออัปเดต Master Warranty (.xlsx)",
+        type=["xlsx"],
+        key="master-upload",
+        help="ใช้ชีต Master_Product_Warranty และคอลัมน์ Article Code พร้อม Product Warranty Term หรือ Standard Base Warranty",
+    )
+    # Read the persisted file on every Streamlit rerun. Uploaded data is not used
+    # for certificates until the user confirms and saves it to disk.
+    master_bytes = MASTER_PATH.read_bytes() if MASTER_PATH.is_file() else None
+    master_hash = hashlib.sha256(master_bytes).hexdigest() if master_bytes is not None else None
+    warranty_map = {}
+    if master_bytes is not None:
+        try:
+            warranty_map = load_master_warranty(io.BytesIO(master_bytes))
+        except Exception as exc:
+            st.error(f"อ่าน Master Warranty หลักไม่สำเร็จ ({exc})")
+            return
+    else:
+        st.info("ยังไม่มี Master หลัก กรุณาอัปโหลดไฟล์ Master Warranty เพื่อตั้งต้น")
+
+    if uploaded_master is not None:
+        incoming_content = uploaded_master.getvalue()
+        try:
+            merged_bytes, changed, added, unchanged, incoming_terms = preview_master_merge(
+                master_bytes, incoming_content
+            )
+        except Exception as exc:
+            st.error(f"ตรวจสอบ Master ที่อัปโหลดไม่สำเร็จ ({exc})")
+        else:
+            st.write(f"ตัวอย่างผลการนำเข้า: เพิ่มใหม่ {len(added)} | เปลี่ยนเงื่อนไข {len(changed)} | เงื่อนไขเดิม {len(unchanged)}")
+            comparison = []
+            for article in added + changed + unchanged:
+                comparison.append({
+                    "Article": article,
+                    "สถานะ": "เพิ่มใหม่" if article in added else ("เงื่อนไขเปลี่ยน" if article in changed else "เงื่อนไขเดิม"),
+                    "เงื่อนไขเดิม": warranty_map.get(article, ""),
+                    "เงื่อนไขใหม่": incoming_terms[article],
+                })
+            st.dataframe(comparison, hide_index=True, use_container_width=True)
+            st.warning("การบันทึกจะอัปเดตไฟล์ Master Warranty หลักในโฟลเดอร์โปรแกรม และมีการสำรองไฟล์เดิมก่อนบันทึก")
+            confirm = st.checkbox("ยืนยันการเพิ่ม/อัปเดต Master Warranty หลัก", key="confirm-master-save")
+            if st.button("Save to Master (บันทึกถาวร)", disabled=not confirm, type="primary"):
+                try:
+                    save_master_persistently(merged_bytes, master_hash)
+                    st.session_state["master-save-message"] = (
+                        f"บันทึก Master สำเร็จ: เพิ่ม {len(added)} Article, "
+                        f"เปลี่ยนเงื่อนไข {len(changed)} Article"
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"ไม่สามารถบันทึก Master Warranty ได้ ({exc})")
+    save_message = st.session_state.pop("master-save-message", None)
+    if save_message:
+        st.success(save_message)
+    if master_bytes is not None:
+        st.caption(f"Master ปัจจุบัน: {MASTER_PATH.name} ({len(warranty_map)} Article) — เก็บไว้บนเครื่องที่รัน Streamlit")
+        st.download_button(
+            "Download Master Warranty (สำรองข้อมูล)", master_bytes,
+            file_name=MASTER_PATH.name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     if not warranty_map:
-        st.info("กรอก Article และ Warranty Condition ในชีต Master_Product_Warranty ก่อนออกเอกสาร")
+        st.warning("ยังไม่มี Master Warranty ที่บันทึกถาวร กรุณาอัปโหลดและกด Save ก่อนออกหนังสือรับประกัน")
+        return
+    master_id = master_hash
+
     if uploaded is None:
         return
 
@@ -329,7 +543,7 @@ def main():
     articles = billing["Article"].loc[billing["Article"].ne("")].unique().tolist()
     scope = f"{upload_id}-{billing_no}"
 
-    st.subheader("2. Warranty Extension")
+    st.subheader("3. Warranty Extension")
     has_extension = st.radio(
         "บิลนี้มีสินค้าที่ซื้อ Warranty Extension เพิ่มเติมหรือไม่?",
         ("No", "Yes"),
@@ -354,7 +568,7 @@ def main():
         if not extension_ready:
             st.warning("เลือก Article และกรอก Billing No. อ้างอิงให้ครบทุก Article ที่ต่อประกัน")
 
-    st.subheader("3. ตรวจสอบและสร้างเอกสาร")
+    st.subheader("4. ตรวจสอบและสร้างเอกสาร")
     try:
         context = prepare_certificate(billing_no, billing, warranty_map, extensions, date.today())
     except ValueError as exc:
@@ -384,7 +598,7 @@ def main():
         return
 
     filename = "Warranty_" + re.sub(r"[^A-Za-z0-9_-]+", "_", billing_no)[:100]
-    result_key = (upload_id, context)
+    result_key = (upload_id, master_id, context)
     if st.button("Generate Warranty Certificate", type="primary"):
         st.session_state.pop("certificate", None)
         try:
